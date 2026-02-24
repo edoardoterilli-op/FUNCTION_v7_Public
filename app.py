@@ -7,7 +7,6 @@ from datetime import datetime
 from pathlib import Path
 import tempfile
 import os
-import io
 import duckdb
 
 # =========================
@@ -53,6 +52,8 @@ OPS_TEXT = [
 # UTIL
 # =========================
 _BAD = re.compile(r'[\\/:*?"<>|]+')
+
+
 def sanitize_name(name: str, fallback="output") -> str:
     name = (name or "").strip()
     name = _BAD.sub("_", name)
@@ -60,19 +61,23 @@ def sanitize_name(name: str, fallback="output") -> str:
     name = name.strip("_")
     return name if name else fallback
 
+
 def db():
     con = duckdb.connect(str(DB_PATH))
     con.execute("PRAGMA threads=4;")
     con.execute("PRAGMA memory_limit='10GB';")
-    con.execute(f"PRAGMA temp_directory='{str(WORK_DIR / 'duck_tmp')}';")
     (WORK_DIR / "duck_tmp").mkdir(parents=True, exist_ok=True)
+    con.execute(f"PRAGMA temp_directory='{str(WORK_DIR / 'duck_tmp')}';")
     return con
+
 
 def qident(name: str) -> str:
     return '"' + name.replace('"', '""') + '"'
 
+
 def sql_lit(s: str) -> str:
     return "'" + (s or "").replace("'", "''") + "'"
+
 
 def declared_type_for_col(file_name: str, col: str) -> str | None:
     steps = st.session_state.STATE["files"][file_name]["steps"]
@@ -84,34 +89,16 @@ def declared_type_for_col(file_name: str, col: str) -> str | None:
                 declared = fmts[col].get("type")
     return declared
 
-# =========================
-# DYNAMIC-SELECT HELPERS (FIX COLS NOT UPDATING)
-# =========================
-def _reset_selectbox_value(key: str):
-    if key in st.session_state:
-        st.session_state.pop(key, None)
 
-def _set_first_option(col_key: str, options: list):
-    # set a safe default if current value isn't valid
+def _set_first_option(key: str, options: list[str]):
+    """Ensure session_state[key] is valid w.r.t options; set to first option if not."""
     if not options:
-        st.session_state[col_key] = None
+        st.session_state[key] = None
         return
-    cur = st.session_state.get(col_key, None)
+    cur = st.session_state.get(key, None)
     if cur not in options:
-        st.session_state[col_key] = options[0]
+        st.session_state[key] = options[0]
 
-def on_file_change(file_key: str, col_key: str):
-    # when file changes, force the column selection to re-align to new options
-    # we do not rerun manually; Streamlit reruns automatically after state change
-    fname = st.session_state.get(file_key, None)
-    options = get_cols(fname) if fname else []
-    _set_first_option(col_key, options)
-
-def on_two_files_change(file_key: str, col_key: str, other_file_key: str = None):
-    # same idea but usable for merge A/B or any two-file contexts
-    fname = st.session_state.get(file_key, None)
-    options = get_cols(fname) if fname else []
-    _set_first_option(col_key, options)
 
 # =========================
 # INGEST: CSV/EXCEL -> DUCKDB TABLE
@@ -121,9 +108,10 @@ def detect_csv_sep_from_sample(text: str) -> str:
     sep = max(candidates, key=candidates.get)
     return sep if candidates[sep] > 0 else ";"
 
+
 def ingest_file_to_duckdb(file_path: Path, import_mode: str) -> tuple[str, list[str]]:
     suf = file_path.suffix.lower()
-    tname = f"base_{sanitize_name(file_path.stem)}_{abs(hash(str(file_path)))%10_000_000}"
+    tname = f"base_{sanitize_name(file_path.stem)}_{abs(hash(str(file_path))) % 10_000_000}"
     tname = sanitize_name(tname)
 
     con = db()
@@ -175,6 +163,7 @@ def ingest_file_to_duckdb(file_path: Path, import_mode: str) -> tuple[str, list[
     finally:
         con.close()
 
+
 def add_loaded_file(name: str, table_name: str, cols: list[str], path: Path, import_mode: str):
     fname = name
     base = fname
@@ -194,13 +183,15 @@ def add_loaded_file(name: str, table_name: str, cols: list[str], path: Path, imp
     st.session_state.STATE["order"].append(fname)
     return fname
 
+
 def clear_cache_from(fname: str, idx: int):
     rec = st.session_state.STATE["files"][fname]
     if rec["smart_cache"]["step_idx"] >= idx:
         rec["smart_cache"] = {"step_idx": -1, "sql": f"SELECT * FROM {qident(rec['table_base'])}"}
 
+
 # =========================
-# STEP -> SQL (semantica invariata)
+# STEP -> SQL
 # =========================
 DATE_INPUT_MAP = {
     "Auto (prova a riconoscere)": {"kind": "auto"},
@@ -214,6 +205,7 @@ DATE_INPUT_MAP = {
     "DD/MM/YYYY HH:MM:SS": {"kind": "fmt", "fmt": "%d/%m/%Y %H:%M:%S"},
 }
 
+
 def sql_parse_number(expr: str, decimal_sep: str | None = None, thousands_sep: str | None = None) -> str:
     x = expr
     x = f"trim({x})"
@@ -224,12 +216,14 @@ def sql_parse_number(expr: str, decimal_sep: str | None = None, thousands_sep: s
         x = f"replace({x}, {sql_lit(decimal_sep)}, '.')"
     return f"try_cast(nullif({x}, '') as DOUBLE)"
 
+
 def sql_parse_date(expr: str, date_input_label: str) -> str:
     spec = DATE_INPUT_MAP.get(date_input_label, {"kind": "auto"})
     kind = spec.get("kind", "auto")
     if kind == "fmt" and spec.get("fmt"):
         return f"try_cast(strptime({expr}, {sql_lit(spec['fmt'])}) as TIMESTAMP)"
     return f"try_cast({expr} as TIMESTAMP)"
+
 
 def get_sql(fname: str) -> str:
     rec = st.session_state.STATE["files"][fname]
@@ -251,6 +245,7 @@ def get_sql(fname: str) -> str:
         rec["smart_cache"] = {"step_idx": len(steps) - 1, "sql": sql}
 
     return sql
+
 
 def step_to_sql(fname: str, step: dict, sql_in: str) -> str:
     t = step["type"]
@@ -327,8 +322,11 @@ def step_to_sql(fname: str, step: dict, sql_in: str) -> str:
                 elif op == "lte": cond = f"{num} <= {n1}"
                 elif op == "eq": cond = f"{num} = {n1}"
                 elif op == "neq": cond = f"{num} <> {n1}"
-                elif op == "between" and n2 is not None: cond = f"({num} between least({n1},{n2}) and greatest({n1},{n2}))"
-                else: cond = "TRUE"
+                elif op == "between" and n2 is not None:
+                    cond = f"({num} between least({n1},{n2}) and greatest({n1},{n2}))"
+                else:
+                    cond = "TRUE"
+
             elif kind == "date":
                 dt = sql_parse_date(f"{cc}", "Auto (prova a riconoscere)")
                 d1 = sql_parse_date(sql_lit(str(v1)), "Auto (prova a riconoscere)")
@@ -337,8 +335,11 @@ def step_to_sql(fname: str, step: dict, sql_in: str) -> str:
                 elif op == "before": cond = f"{dt} < {d1}"
                 elif op == "eq": cond = f"{dt} = {d1}"
                 elif op == "neq": cond = f"{dt} <> {d1}"
-                elif op == "between" and d2 is not None: cond = f"({dt} between least({d1},{d2}) and greatest({d1},{d2}))"
-                else: cond = "TRUE"
+                elif op == "between" and d2 is not None:
+                    cond = f"({dt} between least({d1},{d2}) and greatest({d1},{d2}))"
+                else:
+                    cond = "TRUE"
+
             else:
                 txt = f"coalesce(cast({cc} as VARCHAR),'')"
                 v1s = str(v1 or "")
@@ -350,7 +351,8 @@ def step_to_sql(fname: str, step: dict, sql_in: str) -> str:
                 elif op == "endswith": cond = f"lower({txt}) like '%' || lower({sql_lit(v1s)})"
                 elif op == "is_empty": cond = f"length({txt}) = 0"
                 elif op == "not_empty": cond = f"length({txt}) > 0"
-                else: cond = "TRUE"
+                else:
+                    cond = "TRUE"
 
             parts.append(f"({cond})")
 
@@ -409,7 +411,7 @@ def step_to_sql(fname: str, step: dict, sql_in: str) -> str:
             SELECT *
             FROM {left} AS A
             {join_type} JOIN {right} AS B
-            ON A.{qident(left_on)} = B.{qident(right_on if right_on not in dup else right_on)}
+            ON A.{qident(left_on)} = B.{qident(right_on)}
         """
 
     if t == "calc":
@@ -483,10 +485,11 @@ def step_to_sql(fname: str, step: dict, sql_in: str) -> str:
 
     raise ValueError(f"Step non supportato: {t}")
 
+
 # =========================
 # DATA ACCESS
 # =========================
-def get_cols(fname):
+def get_cols(fname: str | None):
     if not fname:
         return []
     sql = get_sql(fname)
@@ -497,6 +500,7 @@ def get_cols(fname):
     finally:
         con.close()
 
+
 def preview_df(fname, limit=100):
     sql = get_sql(fname)
     con = db()
@@ -504,6 +508,7 @@ def preview_df(fname, limit=100):
         return con.execute(f"SELECT * FROM ({sql}) LIMIT {int(limit)}").df()
     finally:
         con.close()
+
 
 def compute_metric_sql(file_name: str, sql: str, col: str, metric: str, q: float | None = None):
     if metric in ("sum", "average", "median", "quartile", "percentile") and declared_type_for_col(file_name, col) == "text":
@@ -535,6 +540,7 @@ def compute_metric_sql(file_name: str, sql: str, col: str, metric: str, q: float
     finally:
         con.close()
 
+
 # =========================
 # UI HELPERS
 # =========================
@@ -542,7 +548,8 @@ def step_label(st_dict: dict) -> str:
     t, p = st_dict["type"], st_dict["params"]
     if t == "format":
         fmts = p.get("formats", {})
-        if not fmts: return "Formato"
+        if not fmts:
+            return "Formato"
         parts = [f"{c}:{v.get('type','auto')}" for c, v in fmts.items()]
         return "Formato: " + ", ".join(parts)
     if t == "filter":
@@ -562,19 +569,25 @@ def step_label(st_dict: dict) -> str:
         return f"Deduplica su: {p.get('col','')}"
     return t
 
+
 def delete_step(fname, idx):
     del st.session_state.STATE["files"][fname]["steps"][idx:]
     clear_cache_from(fname, idx)
+
 
 def _base_add_step(f, step):
     st.session_state.STATE["files"][f]["steps"].append(step)
     clear_cache_from(f, len(st.session_state.STATE["files"][f]["steps"]) - 1)
 
+
 # =========================
 # UI
 # =========================
 st.title("⚡ Power Query Web UI (Hugging Face / DuckDB)")
-st.markdown("Versione scalabile (on-disk). **Fix inclusi**: le colonne si aggiornano correttamente in ogni sezione quando cambi file.")
+st.markdown(
+    "Versione scalabile (on-disk). **Fix**: niente callback dentro `st.form()` (evita `StreamlitInvalidFormCallbackError`). "
+    "Le colonne si riallineano automaticamente quando cambi file."
+)
 
 files_in_mem = st.session_state.STATE["order"]
 
@@ -636,7 +649,6 @@ with t_files:
             st.session_state.STATE = {"files": {}, "order": []}
             st.session_state.calc_ops_list = []
             st.session_state.run_conds = []
-            # reset also dependent widgets
             for k in list(st.session_state.keys()):
                 if k.startswith(("fmt_", "prev_", "sflt_", "dd_", "m_", "mon_", "calc_", "ifs_", "met_", "exp_")):
                     st.session_state.pop(k, None)
@@ -650,14 +662,7 @@ with t_prev:
         with col1:
             st.subheader("Applica Formato")
             with st.form("fmt_form"):
-                # file -> col dependent (FIX)
-                fmt_file = st.selectbox(
-                    "File:",
-                    files_in_mem,
-                    key="fmt_f",
-                    on_change=on_file_change,
-                    args=("fmt_f", "fmt_c"),
-                )
+                fmt_file = st.selectbox("File:", files_in_mem, key="fmt_f")
                 fmt_cols = get_cols(fmt_file)
                 _set_first_option("fmt_c", fmt_cols)
 
@@ -676,9 +681,12 @@ with t_prev:
                 submitted = st.form_submit_button("✅ Applica Formato")
                 if submitted:
                     spec = {"type": fmt_type}
-                    if date_input: spec["date_input"] = date_input
-                    if dec_sep: spec["decimal_sep"] = dec_sep
-                    if thou_sep: spec["thousands_sep"] = thou_sep
+                    if date_input:
+                        spec["date_input"] = date_input
+                    if dec_sep:
+                        spec["decimal_sep"] = dec_sep
+                    if thou_sep:
+                        spec["thousands_sep"] = thou_sep
                     step = {"type": "format", "created_at": datetime.now().isoformat(), "params": {"formats": {fmt_col: spec}}}
                     _base_add_step(fmt_file, step)
                     st.success("Formato applicato!")
@@ -686,12 +694,7 @@ with t_prev:
 
         with col2:
             st.subheader("Anteprima Dati")
-            prev_file = st.selectbox(
-                "Scegli file:",
-                files_in_mem,
-                key="prev_f",
-                on_change=lambda: None
-            )
+            prev_file = st.selectbox("Scegli file:", files_in_mem, key="prev_f")
             if prev_file:
                 df_prev = preview_df(prev_file, limit=100)
                 st.write("Mostrando le prime 100 righe.")
@@ -704,13 +707,7 @@ with t_flt:
         with st.form("single_filter_form"):
             c1, c2, c3 = st.columns(3)
 
-            flt_file = c1.selectbox(
-                "File:",
-                files_in_mem,
-                key="sflt_f",
-                on_change=on_file_change,
-                args=("sflt_f", "sflt_c"),
-            )
+            flt_file = c1.selectbox("File:", files_in_mem, key="sflt_f")
             sflt_cols = get_cols(flt_file)
             _set_first_option("sflt_c", sflt_cols)
 
@@ -735,8 +732,8 @@ with t_flt:
             if submitted:
                 val1 = v1.isoformat() if flt_kind == "date" else v1
                 val2 = v2.isoformat() if (flt_kind == "date" and v2) else v2
-                step = {"type":"filter", "created_at": datetime.now().isoformat(),
-                        "params":{"col": flt_col, "kind": flt_kind, "op": flt_op, "v1": val1, "v2": val2}}
+                step = {"type": "filter", "created_at": datetime.now().isoformat(),
+                        "params": {"col": flt_col, "kind": flt_kind, "op": flt_op, "v1": val1, "v2": val2}}
                 _base_add_step(flt_file, step)
                 st.success("Filtro applicato!")
                 st.rerun()
@@ -746,13 +743,7 @@ with t_flt:
         with st.form("dedupe_form"):
             c1, c2 = st.columns(2)
 
-            dd_file = c1.selectbox(
-                "File:",
-                files_in_mem,
-                key="dd_f",
-                on_change=on_file_change,
-                args=("dd_f", "dd_c"),
-            )
+            dd_file = c1.selectbox("File:", files_in_mem, key="dd_f")
             dd_cols = get_cols(dd_file)
             _set_first_option("dd_c", dd_cols)
 
@@ -771,27 +762,14 @@ with t_merge:
         merge_mode = st.radio(
             "Destinazione:",
             ["existing", "new"],
-            format_func=lambda x: "Mergia su file esistente (A)" if x=="existing" else "Crea NUOVO file in memoria",
+            format_func=lambda x: "Mergia su file esistente (A)" if x == "existing" else "Crea NUOVO file in memoria",
             key="merge_mode"
         )
         new_name = st.text_input("Nome nuovo file:", "merged_1", key="merge_new_name") if merge_mode == "new" else None
 
         c1, c2 = st.columns(2)
-
-        m_A = c1.selectbox(
-            "File A (Base):",
-            files_in_mem,
-            key="m_A",
-            on_change=on_two_files_change,
-            args=("m_A", "mon_A"),
-        )
-        m_B = c2.selectbox(
-            "File B (Da unire):",
-            files_in_mem,
-            key="m_B",
-            on_change=on_two_files_change,
-            args=("m_B", "mon_B"),
-        )
+        m_A = c1.selectbox("File A (Base):", files_in_mem, key="m_A")
+        m_B = c2.selectbox("File B (Da unire):", files_in_mem, key="m_B")
 
         cols_A = get_cols(m_A)
         cols_B = get_cols(m_B)
@@ -804,9 +782,12 @@ with t_merge:
 
         c5, c6 = st.columns(2)
         m_how = c5.selectbox("Tipo Join:", ["left", "right", "inner", "outer"], key="m_how")
-        m_coll = c6.selectbox("Collisioni nomi:", ["suffix", "keep_left", "keep_right"],
-                              format_func=lambda x: "Aggiungi _B automatico" if x=="suffix" else x,
-                              key="m_coll")
+        m_coll = c6.selectbox(
+            "Collisioni nomi:",
+            ["suffix", "keep_left", "keep_right"],
+            format_func=lambda x: "Aggiungi _B automatico" if x == "suffix" else x,
+            key="m_coll"
+        )
 
         if st.button("🔗 Esegui Merge", type="primary", key="btn_merge"):
             if merge_mode == "existing":
@@ -824,7 +805,7 @@ with t_merge:
 
                 con = db()
                 try:
-                    tname = f"base_{nn}_{abs(hash((m_A,m_B,datetime.now().isoformat())))%10_000_000}"
+                    tname = f"base_{nn}_{abs(hash((m_A, m_B, datetime.now().isoformat()))) % 10_000_000}"
                     tname = sanitize_name(tname)
                     con.execute(f"CREATE OR REPLACE TABLE {qident(tname)} AS {merged_sql};")
                     cols = [r[0] for r in con.execute(f"DESCRIBE {qident(tname)}").fetchall()]
@@ -842,13 +823,7 @@ with t_calc:
         st.info("I vuoti valgono 0. Le operazioni vengono eseguite rigorosamente da sinistra a destra.")
 
         c1, c2 = st.columns(2)
-        calc_f = c1.selectbox(
-            "File:",
-            files_in_mem,
-            key="calc_f",
-            on_change=on_file_change,
-            args=("calc_f", "calc_base"),
-        )
+        calc_f = c1.selectbox("File:", files_in_mem, key="calc_f")
         calc_cols = get_cols(calc_f)
         _set_first_option("calc_base", calc_cols)
         _set_first_option("calc_next", calc_cols)
@@ -862,7 +837,7 @@ with t_calc:
                 "Op:",
                 ["add", "sub", "mul", "div"],
                 key="calc_add_op",
-                format_func=lambda x: {"add":"+ (Somma)","sub":"- (Sottrai)","mul":"* (Moltiplica)","div":"/ (Dividi)"}[x]
+                format_func=lambda x: {"add": "+ (Somma)", "sub": "- (Sottrai)", "mul": "* (Moltiplica)", "div": "/ (Dividi)"}[x]
             )
             add_col = cc2.selectbox("Con colonna:", calc_cols, key="calc_next")
 
@@ -893,20 +868,8 @@ with t_calc:
         with st.form("ifs_form"):
             c1, c2 = st.columns(2)
 
-            ifs_A = c1.selectbox(
-                "File Destinazione (A):",
-                files_in_mem,
-                key="ifs_a",
-                on_change=on_file_change,
-                args=("ifs_a", "im_a"),
-            )
-            ifs_B = c2.selectbox(
-                "File Ricerca (B):",
-                files_in_mem,
-                key="ifs_b",
-                on_change=on_file_change,
-                args=("ifs_b", "im_b"),
-            )
+            ifs_A = c1.selectbox("File Destinazione (A):", files_in_mem, key="ifs_a")
+            ifs_B = c2.selectbox("File Ricerca (B):", files_in_mem, key="ifs_b")
 
             cols_A = get_cols(ifs_A)
             cols_B = get_cols(ifs_B)
@@ -929,9 +892,9 @@ with t_calc:
                 if metric in ["sumifs", "averageifs"] and not val_col:
                     st.error("Seleziona una colonna valore per SUM/AVERAGE.")
                 else:
-                    step = {"type":"ifs", "created_at": datetime.now().isoformat(),
-                            "params":{"lookup_file": ifs_B, "match_a_col": ifs_match_a, "match_b_col": ifs_match_b,
-                                      "metric": metric, "value_col": val_col, "outcol": ifs_out, "conds": st.session_state.run_conds}}
+                    step = {"type": "ifs", "created_at": datetime.now().isoformat(),
+                            "params": {"lookup_file": ifs_B, "match_a_col": ifs_match_a, "match_b_col": ifs_match_b,
+                                       "metric": metric, "value_col": val_col, "outcol": ifs_out, "conds": st.session_state.run_conds}}
                     _base_add_step(ifs_A, step)
                     st.success("IFS applicato!")
                     st.rerun()
@@ -942,13 +905,7 @@ with t_metr:
         st.subheader("Calcola Metrica Veloce (Senza creare Step)")
         c1, c2 = st.columns(2)
 
-        met_file = c1.selectbox(
-            "File:",
-            files_in_mem,
-            key="met_f",
-            on_change=on_file_change,
-            args=("met_f", "met_c"),
-        )
+        met_file = c1.selectbox("File:", files_in_mem, key="met_f")
         met_cols = get_cols(met_file)
         _set_first_option("met_c", met_cols)
 
