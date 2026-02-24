@@ -1,6 +1,5 @@
 import streamlit as st
 import pandas as pd
-import numpy as np
 import re
 import warnings
 from datetime import datetime
@@ -12,7 +11,7 @@ import duckdb
 # =========================
 # CONFIG
 # =========================
-st.set_page_config(page_title="Power Query Web UI (HF / DuckDB)", page_icon="⚡", layout="wide")
+st.set_page_config(page_title="Power Query Web UI (DuckDB)", page_icon="⚡", layout="wide")
 warnings.filterwarnings("ignore", category=pd.errors.DtypeWarning)
 
 APP_DIR = Path(__file__).parent.resolve()
@@ -207,8 +206,7 @@ DATE_INPUT_MAP = {
 
 
 def sql_parse_number(expr: str, decimal_sep: str | None = None, thousands_sep: str | None = None) -> str:
-    x = expr
-    x = f"trim({x})"
+    x = f"trim({expr})"
     if thousands_sep and thousands_sep != "__NONE__":
         x = f"replace({x}, {sql_lit(thousands_sep)}, '')"
     x = f"replace(replace({x}, '€',''), '%','')"
@@ -240,8 +238,7 @@ def get_sql(fname: str) -> str:
     start_idx = cache_idx + 1
     if start_idx < len(steps):
         for i in range(start_idx, len(steps)):
-            st_dict = steps[i]
-            sql = step_to_sql(fname, st_dict, sql)
+            sql = step_to_sql(fname, steps[i], sql)
         rec["smart_cache"] = {"step_idx": len(steps) - 1, "sql": sql}
 
     return sql
@@ -301,65 +298,6 @@ def step_to_sql(fname: str, step: dict, sql_in: str) -> str:
 
         return f"SELECT * FROM ({sql_in}) WHERE {cond}"
 
-    if t == "filter_multi":
-        logic = p.get("logic", "AND").upper()
-        conds = p.get("conds", [])
-        if not conds:
-            return sql_in
-
-        parts = []
-        for cnd in conds:
-            col = cnd["col"]; kind = cnd["kind"]; op = cnd["op"]; v1 = cnd["v1"]; v2 = cnd.get("v2")
-            cc = qident(col)
-
-            if kind == "number":
-                num = sql_parse_number(f"{cc}")
-                n1 = sql_parse_number(sql_lit(str(v1)))
-                n2 = sql_parse_number(sql_lit(str(v2))) if v2 else None
-                if op == "gt": cond = f"{num} > {n1}"
-                elif op == "gte": cond = f"{num} >= {n1}"
-                elif op == "lt": cond = f"{num} < {n1}"
-                elif op == "lte": cond = f"{num} <= {n1}"
-                elif op == "eq": cond = f"{num} = {n1}"
-                elif op == "neq": cond = f"{num} <> {n1}"
-                elif op == "between" and n2 is not None:
-                    cond = f"({num} between least({n1},{n2}) and greatest({n1},{n2}))"
-                else:
-                    cond = "TRUE"
-
-            elif kind == "date":
-                dt = sql_parse_date(f"{cc}", "Auto (prova a riconoscere)")
-                d1 = sql_parse_date(sql_lit(str(v1)), "Auto (prova a riconoscere)")
-                d2 = sql_parse_date(sql_lit(str(v2)), "Auto (prova a riconoscere)") if v2 else None
-                if op == "after": cond = f"{dt} > {d1}"
-                elif op == "before": cond = f"{dt} < {d1}"
-                elif op == "eq": cond = f"{dt} = {d1}"
-                elif op == "neq": cond = f"{dt} <> {d1}"
-                elif op == "between" and d2 is not None:
-                    cond = f"({dt} between least({d1},{d2}) and greatest({d1},{d2}))"
-                else:
-                    cond = "TRUE"
-
-            else:
-                txt = f"coalesce(cast({cc} as VARCHAR),'')"
-                v1s = str(v1 or "")
-                if op == "eq": cond = f"{txt} = {sql_lit(v1s)}"
-                elif op == "neq": cond = f"{txt} <> {sql_lit(v1s)}"
-                elif op == "contains": cond = f"lower({txt}) like '%' || lower({sql_lit(v1s)}) || '%'"
-                elif op == "not_contains": cond = f"not (lower({txt}) like '%' || lower({sql_lit(v1s)}) || '%')"
-                elif op == "startswith": cond = f"lower({txt}) like lower({sql_lit(v1s)}) || '%'"
-                elif op == "endswith": cond = f"lower({txt}) like '%' || lower({sql_lit(v1s)})"
-                elif op == "is_empty": cond = f"length({txt}) = 0"
-                elif op == "not_empty": cond = f"length({txt}) > 0"
-                else:
-                    cond = "TRUE"
-
-            parts.append(f"({cond})")
-
-        glue = " OR " if logic == "OR" else " AND "
-        where = glue.join(parts) if parts else "TRUE"
-        return f"SELECT * FROM ({sql_in}) WHERE {where}"
-
     if t == "dedupe":
         col = p["col"]
         c = qident(col)
@@ -416,8 +354,8 @@ def step_to_sql(fname: str, step: dict, sql_in: str) -> str:
 
     if t == "calc":
         outcol = p["outcol"]
-        base_col = p.get("col_left", p.get("base_col"))
-        ops = [{"op": p["op"], "col": p["col_right"]}] if "col_left" in p else p.get("ops", [])
+        base_col = p.get("base_col")
+        ops = p.get("ops", [])
 
         if declared_type_for_col(fname, base_col) == "text":
             raise ValueError("Operazioni non consentite su Testo.")
@@ -460,21 +398,17 @@ def step_to_sql(fname: str, step: dict, sql_in: str) -> str:
 
         if metric == "countifs":
             agg = f"SELECT {bkey} AS k, count(*)::BIGINT AS v FROM ({lookup_sql}) GROUP BY 1"
+            vexpr = "coalesce(B.v, 0)::BIGINT"
         else:
             if declared_type_for_col(lookup_file, value_col) == "text":
                 raise ValueError("Colonna valore formattata come Testo.")
             val = f"{sql_parse_number(qident(value_col))}"
             if metric == "sumifs":
                 agg = f"SELECT {bkey} AS k, coalesce(sum({val}),0.0) AS v FROM ({lookup_sql}) GROUP BY 1"
+                vexpr = "coalesce(B.v, 0.0)"
             else:
                 agg = f"SELECT {bkey} AS k, avg({val}) AS v FROM ({lookup_sql}) GROUP BY 1"
-
-        if metric == "countifs":
-            vexpr = "coalesce(B.v, 0)::BIGINT"
-        elif metric == "sumifs":
-            vexpr = "coalesce(B.v, 0.0)"
-        else:
-            vexpr = "B.v"
+                vexpr = "B.v"
 
         return f"""
             SELECT A.*, {vexpr} AS {qident(outcol)}
@@ -495,8 +429,7 @@ def get_cols(fname: str | None):
     sql = get_sql(fname)
     con = db()
     try:
-        cols = [r[0] for r in con.execute(f"DESCRIBE ({sql})").fetchall()]
-        return cols
+        return [r[0] for r in con.execute(f"DESCRIBE ({sql})").fetchall()]
     finally:
         con.close()
 
@@ -556,8 +489,6 @@ def step_label(st_dict: dict) -> str:
         if p["op"] == "between":
             return f"Filtro: {p['col']} tra {p['v1']} e {p.get('v2')}"
         return f"Filtro: {p['col']} {p['op']} {p['v1']}"
-    if t == "filter_multi":
-        return f"Filtro multiplo ({p.get('logic','AND')}) con {len(p.get('conds',[]))} condiz."
     if t == "merge":
         return f"MERGE ({p['how'].upper()}) con '{p['right_file']}' su '{p['left_on']}'='{p['right_on']}'"
     if t == "ifs":
@@ -583,11 +514,8 @@ def _base_add_step(f, step):
 # =========================
 # UI
 # =========================
-st.title("⚡ Power Query Web UI (Hugging Face / DuckDB)")
-st.markdown(
-    "Versione scalabile (on-disk). **Fix**: niente callback dentro `st.form()` (evita `StreamlitInvalidFormCallbackError`). "
-    "Le colonne si riallineano automaticamente quando cambi file."
-)
+st.title("⚡ Power Query Web UI (DuckDB)")
+st.caption("Fix: selettori (File/Colonne) fuori dalle form → opzioni sempre aggiornate.")
 
 files_in_mem = st.session_state.STATE["order"]
 
@@ -607,24 +535,23 @@ with t_files:
     )
 
     uploaded_files = st.file_uploader("Trascina CSV o Excel qui", accept_multiple_files=True, key="uploader")
-    if uploaded_files:
-        if st.button("Carica File Selezionati", type="primary", key="btn_load"):
-            prog = st.progress(0.0, "Upload + ingest in DuckDB...")
-            for idx, uf in enumerate(uploaded_files):
-                temp_path = Path(st.session_state.temp_dir) / uf.name
-                with open(temp_path, "wb") as f:
-                    f.write(uf.getbuffer())
+    if uploaded_files and st.button("Carica File Selezionati", type="primary", key="btn_load"):
+        prog = st.progress(0.0, "Upload + ingest in DuckDB...")
+        for idx, uf in enumerate(uploaded_files):
+            temp_path = Path(st.session_state.temp_dir) / uf.name
+            with open(temp_path, "wb") as f:
+                f.write(uf.getbuffer())
 
-                try:
-                    prog.progress(idx / max(1, len(uploaded_files)), text=f"Ingest: {uf.name}")
-                    tname, cols = ingest_file_to_duckdb(temp_path, import_mode=import_mode)
-                    add_loaded_file(uf.name, tname, cols, temp_path, import_mode)
-                    st.success(f"✅ {uf.name} importato ({len(cols)} colonne)")
-                except Exception as e:
-                    st.error(f"❌ Errore su {uf.name}: {e}")
+            try:
+                prog.progress(idx / max(1, len(uploaded_files)), text=f"Ingest: {uf.name}")
+                tname, cols = ingest_file_to_duckdb(temp_path, import_mode=import_mode)
+                add_loaded_file(uf.name, tname, cols, temp_path, import_mode)
+                st.success(f"✅ {uf.name} importato ({len(cols)} colonne)")
+            except Exception as e:
+                st.error(f"❌ Errore su {uf.name}: {e}")
 
-            prog.progress(1.0, text="Completato")
-            st.rerun()
+        prog.progress(1.0, text="Completato")
+        st.rerun()
 
     st.divider()
     st.subheader("Step Applicati")
@@ -661,11 +588,13 @@ with t_prev:
 
         with col1:
             st.subheader("Applica Formato")
-            with st.form("fmt_form"):
-                fmt_file = st.selectbox("File:", files_in_mem, key="fmt_f")
-                fmt_cols = get_cols(fmt_file)
-                _set_first_option("fmt_c", fmt_cols)
 
+            # ✅ OUTSIDE FORM: file drives column options
+            fmt_file = st.selectbox("File:", files_in_mem, key="fmt_f")
+            fmt_cols = get_cols(fmt_file)
+            _set_first_option("fmt_c", fmt_cols)
+
+            with st.form("fmt_form"):
                 fmt_col = st.selectbox("Colonna:", fmt_cols, key="fmt_c")
                 fmt_type = st.selectbox("Tipo:", ["auto", "text", "number", "currency", "percent", "date", "datetime"], key="fmt_t")
 
@@ -687,6 +616,7 @@ with t_prev:
                         spec["decimal_sep"] = dec_sep
                     if thou_sep:
                         spec["thousands_sep"] = thou_sep
+
                     step = {"type": "format", "created_at": datetime.now().isoformat(), "params": {"formats": {fmt_col: spec}}}
                     _base_add_step(fmt_file, step)
                     st.success("Formato applicato!")
@@ -704,20 +634,21 @@ with t_prev:
 with t_flt:
     if files_in_mem:
         st.subheader("Filtro Singolo")
+
+        # ✅ OUTSIDE FORM: file (and kind) drive options
+        c1, c2, c3 = st.columns(3)
+        flt_file = c1.selectbox("File:", files_in_mem, key="sflt_f")
+        sflt_cols = get_cols(flt_file)
+        _set_first_option("sflt_c", sflt_cols)
+
+        flt_col = c2.selectbox("Colonna:", sflt_cols, key="sflt_c")
+        flt_kind = c3.selectbox("Tipo dato:", ["number", "text", "date"], key="sflt_kind")
+
+        ops = OPS_NUMBER if flt_kind == "number" else (OPS_DATE if flt_kind == "date" else OPS_TEXT)
+        op_values = [v for (v, _) in ops]
+        op_labels = {v: lab for (v, lab) in ops}
+
         with st.form("single_filter_form"):
-            c1, c2, c3 = st.columns(3)
-
-            flt_file = c1.selectbox("File:", files_in_mem, key="sflt_f")
-            sflt_cols = get_cols(flt_file)
-            _set_first_option("sflt_c", sflt_cols)
-
-            flt_col = c2.selectbox("Colonna:", sflt_cols, key="sflt_c")
-            flt_kind = c3.selectbox("Tipo dato:", ["number", "text", "date"], key="sflt_kind")
-
-            ops = OPS_NUMBER if flt_kind == "number" else (OPS_DATE if flt_kind == "date" else OPS_TEXT)
-            op_values = [v for (v, _) in ops]
-            op_labels = {v: lab for (v, lab) in ops}
-
             c4, c5 = st.columns([1, 2])
             flt_op = c4.selectbox("Operatore:", op_values, format_func=lambda v: op_labels.get(v, v), key="sflt_op")
 
@@ -740,14 +671,15 @@ with t_flt:
 
         st.divider()
         st.subheader("Rimuovi Duplicati")
+
+        # ✅ OUTSIDE FORM
+        c1, c2 = st.columns(2)
+        dd_file = c1.selectbox("File:", files_in_mem, key="dd_f")
+        dd_cols = get_cols(dd_file)
+        _set_first_option("dd_c", dd_cols)
+        dd_col = c2.selectbox("Colonna chiave:", dd_cols, key="dd_c")
+
         with st.form("dedupe_form"):
-            c1, c2 = st.columns(2)
-
-            dd_file = c1.selectbox("File:", files_in_mem, key="dd_f")
-            dd_cols = get_cols(dd_file)
-            _set_first_option("dd_c", dd_cols)
-
-            dd_col = c2.selectbox("Colonna chiave:", dd_cols, key="dd_c")
             submitted = st.form_submit_button("🧹 Rimuovi Duplicati")
             if submitted:
                 step = {"type": "dedupe", "created_at": datetime.now().isoformat(), "params": {"col": dd_col, "keep": "first"}}
@@ -790,17 +722,16 @@ with t_merge:
         )
 
         if st.button("🔗 Esegui Merge", type="primary", key="btn_merge"):
+            step = {"type": "merge", "created_at": datetime.now().isoformat(),
+                    "params": {"right_file": m_B, "how": m_how, "left_on": m_on_A, "right_on": m_on_B, "collision": m_coll}}
+
             if merge_mode == "existing":
-                step = {"type": "merge", "created_at": datetime.now().isoformat(),
-                        "params": {"right_file": m_B, "how": m_how, "left_on": m_on_A, "right_on": m_on_B, "collision": m_coll}}
                 _base_add_step(m_A, step)
                 st.success("Merge aggiunto come step!")
                 st.rerun()
             else:
                 nn = sanitize_name(new_name, "merged_1")
                 sqlA = get_sql(m_A)
-                step = {"type": "merge", "created_at": datetime.now().isoformat(),
-                        "params": {"right_file": m_B, "how": m_how, "left_on": m_on_A, "right_on": m_on_B, "collision": m_coll}}
                 merged_sql = step_to_sql(m_A, step, sqlA)
 
                 con = db()
@@ -865,18 +796,19 @@ with t_calc:
 
         st.divider()
         st.subheader("Aggregazione IFS (Es. Somma se, Conta se)")
+
+        # ✅ OUTSIDE FORM: pick A/B and compute columns
+        c1, c2 = st.columns(2)
+        ifs_A = c1.selectbox("File Destinazione (A):", files_in_mem, key="ifs_a")
+        ifs_B = c2.selectbox("File Ricerca (B):", files_in_mem, key="ifs_b")
+
+        cols_A = get_cols(ifs_A)
+        cols_B = get_cols(ifs_B)
+        _set_first_option("im_a", cols_A)
+        _set_first_option("im_b", cols_B)
+        _set_first_option("ifs_val_col", [""] + cols_B)
+
         with st.form("ifs_form"):
-            c1, c2 = st.columns(2)
-
-            ifs_A = c1.selectbox("File Destinazione (A):", files_in_mem, key="ifs_a")
-            ifs_B = c2.selectbox("File Ricerca (B):", files_in_mem, key="ifs_b")
-
-            cols_A = get_cols(ifs_A)
-            cols_B = get_cols(ifs_B)
-            _set_first_option("im_a", cols_A)
-            _set_first_option("im_b", cols_B)
-            _set_first_option("ifs_val_col", [""] + cols_B)
-
             c3, c4 = st.columns(2)
             ifs_match_a = c3.selectbox("Col. Match in A:", cols_A, key="im_a")
             ifs_match_b = c4.selectbox("Col. Match in B:", cols_B, key="im_b")
@@ -908,7 +840,6 @@ with t_metr:
         met_file = c1.selectbox("File:", files_in_mem, key="met_f")
         met_cols = get_cols(met_file)
         _set_first_option("met_c", met_cols)
-
         met_col = c2.selectbox("Colonna:", met_cols, key="met_c")
 
         c3, c4 = st.columns(2)
