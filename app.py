@@ -19,7 +19,6 @@ warnings.filterwarnings("ignore", category=pd.errors.DtypeWarning)
 APP_DIR = Path(__file__).parent.resolve()
 WORK_DIR = Path(os.getenv("PQ_WORKDIR", APP_DIR / "pq_workdir"))
 WORK_DIR.mkdir(parents=True, exist_ok=True)
-
 DB_PATH = WORK_DIR / "pq.duckdb"
 
 # =========================
@@ -35,24 +34,10 @@ if "run_conds" not in st.session_state:
     st.session_state.run_conds = []
 
 # =========================
-# OPS UI
+# OPS UI (values are internal op codes)
 # =========================
-OPS_NUMBER = [
-    ("gt", ">"),
-    ("gte", "≥"),
-    ("lt", "<"),
-    ("lte", "≤"),
-    ("eq", "="),
-    ("neq", "≠"),
-    ("between", "Tra (incluso)"),
-]
-OPS_DATE = [
-    ("after", "Dopo"),
-    ("before", "Prima"),
-    ("eq", "Uguale"),
-    ("neq", "Diversa"),
-    ("between", "Tra (incluso)"),
-]
+OPS_NUMBER = [("gt", ">"), ("gte", "≥"), ("lt", "<"), ("lte", "≤"), ("eq", "="), ("neq", "≠"), ("between", "Tra (incluso)")]
+OPS_DATE = [("after", "Dopo"), ("before", "Prima"), ("eq", "Uguale"), ("neq", "Diversa"), ("between", "Tra (incluso)")]
 OPS_TEXT = [
     ("eq", "Uguale"),
     ("neq", "Diverso"),
@@ -63,18 +48,6 @@ OPS_TEXT = [
     ("is_empty", "Vuoto"),
     ("not_empty", "Non vuoto"),
 ]
-
-DATE_INPUT_MAP = {
-    "Auto (prova a riconoscere)": {"kind": "auto"},
-    "YYYY-MM-DD (es. 2024-01-31)": {"kind": "fmt", "fmt": "%Y-%m-%d"},
-    "DD/MM/YYYY (es. 31/01/2024)": {"kind": "fmt", "fmt": "%d/%m/%Y"},
-    "MM/DD/YYYY (es. 01/31/2024)": {"kind": "fmt", "fmt": "%m/%d/%Y"},
-    "YYYY/MM/DD (es. 2024/01/31)": {"kind": "fmt", "fmt": "%Y/%m/%d"},
-    "DD-MM-YYYY (es. 31-01-2024)": {"kind": "fmt", "fmt": "%d-%m-%Y"},
-    "Datetime auto": {"kind": "auto_dt"},
-    "YYYY-MM-DD HH:MM:SS": {"kind": "fmt", "fmt": "%Y-%m-%d %H:%M:%S"},
-    "DD/MM/YYYY HH:MM:SS": {"kind": "fmt", "fmt": "%d/%m/%Y %H:%M:%S"},
-}
 
 # =========================
 # UTIL
@@ -91,7 +64,7 @@ def db():
     con = duckdb.connect(str(DB_PATH))
     con.execute("PRAGMA threads=4;")
     con.execute("PRAGMA memory_limit='10GB';")
-    con.execute("PRAGMA temp_directory='{}';".format(str(WORK_DIR / "duck_tmp")))
+    con.execute(f"PRAGMA temp_directory='{str(WORK_DIR / 'duck_tmp')}';")
     (WORK_DIR / "duck_tmp").mkdir(parents=True, exist_ok=True)
     return con
 
@@ -100,23 +73,6 @@ def qident(name: str) -> str:
 
 def sql_lit(s: str) -> str:
     return "'" + (s or "").replace("'", "''") + "'"
-
-def reset_keys(keys: list[str]):
-    for k in keys:
-        if k in st.session_state:
-            del st.session_state[k]
-
-def ensure_dep_updates(prefix: str, file_key: str, dep_keys: list[str]):
-    """
-    Se cambia il file selezionato, resetta chiavi dipendenti (colonna/operatore/valori)
-    per evitare che Streamlit tenga valori non validi e non aggiorni le opzioni.
-    """
-    prev_key = f"{prefix}__prev_file"
-    cur = st.session_state.get(file_key, None)
-    prev = st.session_state.get(prev_key, None)
-    if cur != prev:
-        reset_keys(dep_keys)
-        st.session_state[prev_key] = cur
 
 def declared_type_for_col(file_name: str, col: str) -> str | None:
     steps = st.session_state.STATE["files"][file_name]["steps"]
@@ -129,7 +85,36 @@ def declared_type_for_col(file_name: str, col: str) -> str | None:
     return declared
 
 # =========================
-# INGEST
+# DYNAMIC-SELECT HELPERS (FIX COLS NOT UPDATING)
+# =========================
+def _reset_selectbox_value(key: str):
+    if key in st.session_state:
+        st.session_state.pop(key, None)
+
+def _set_first_option(col_key: str, options: list):
+    # set a safe default if current value isn't valid
+    if not options:
+        st.session_state[col_key] = None
+        return
+    cur = st.session_state.get(col_key, None)
+    if cur not in options:
+        st.session_state[col_key] = options[0]
+
+def on_file_change(file_key: str, col_key: str):
+    # when file changes, force the column selection to re-align to new options
+    # we do not rerun manually; Streamlit reruns automatically after state change
+    fname = st.session_state.get(file_key, None)
+    options = get_cols(fname) if fname else []
+    _set_first_option(col_key, options)
+
+def on_two_files_change(file_key: str, col_key: str, other_file_key: str = None):
+    # same idea but usable for merge A/B or any two-file contexts
+    fname = st.session_state.get(file_key, None)
+    options = get_cols(fname) if fname else []
+    _set_first_option(col_key, options)
+
+# =========================
+# INGEST: CSV/EXCEL -> DUCKDB TABLE
 # =========================
 def detect_csv_sep_from_sample(text: str) -> str:
     candidates = {";": text.count(";"), ",": text.count(","), "\t": text.count("\t"), "|": text.count("|")}
@@ -215,14 +200,27 @@ def clear_cache_from(fname: str, idx: int):
         rec["smart_cache"] = {"step_idx": -1, "sql": f"SELECT * FROM {qident(rec['table_base'])}"}
 
 # =========================
-# STEP -> SQL
+# STEP -> SQL (semantica invariata)
 # =========================
+DATE_INPUT_MAP = {
+    "Auto (prova a riconoscere)": {"kind": "auto"},
+    "YYYY-MM-DD (es. 2024-01-31)": {"kind": "fmt", "fmt": "%Y-%m-%d"},
+    "DD/MM/YYYY (es. 31/01/2024)": {"kind": "fmt", "fmt": "%d/%m/%Y"},
+    "MM/DD/YYYY (es. 01/31/2024)": {"kind": "fmt", "fmt": "%m/%d/%Y"},
+    "YYYY/MM/DD (es. 2024/01/31)": {"kind": "fmt", "fmt": "%Y/%m/%d"},
+    "DD-MM-YYYY (es. 31-01-2024)": {"kind": "fmt", "fmt": "%d-%m-%Y"},
+    "Datetime auto": {"kind": "auto_dt"},
+    "YYYY-MM-DD HH:MM:SS": {"kind": "fmt", "fmt": "%Y-%m-%d %H:%M:%S"},
+    "DD/MM/YYYY HH:MM:SS": {"kind": "fmt", "fmt": "%d/%m/%Y %H:%M:%S"},
+}
+
 def sql_parse_number(expr: str, decimal_sep: str | None = None, thousands_sep: str | None = None) -> str:
-    x = f"trim({expr})"
+    x = expr
+    x = f"trim({x})"
     if thousands_sep and thousands_sep != "__NONE__":
         x = f"replace({x}, {sql_lit(thousands_sep)}, '')"
     x = f"replace(replace({x}, '€',''), '%','')"
-    if decimal_sep and decimal_sep != "." and decimal_sep != "":
+    if decimal_sep and decimal_sep not in (".", ""):
         x = f"replace({x}, {sql_lit(decimal_sep)}, '.')"
     return f"try_cast(nullif({x}, '') as DOUBLE)"
 
@@ -232,6 +230,27 @@ def sql_parse_date(expr: str, date_input_label: str) -> str:
     if kind == "fmt" and spec.get("fmt"):
         return f"try_cast(strptime({expr}, {sql_lit(spec['fmt'])}) as TIMESTAMP)"
     return f"try_cast({expr} as TIMESTAMP)"
+
+def get_sql(fname: str) -> str:
+    rec = st.session_state.STATE["files"][fname]
+    base_sql = f"SELECT * FROM {qident(rec['table_base'])}"
+    steps = rec["steps"]
+
+    cache_idx = rec["smart_cache"]["step_idx"]
+    sql = rec["smart_cache"]["sql"]
+
+    if cache_idx >= len(steps):
+        cache_idx = -1
+        sql = base_sql
+
+    start_idx = cache_idx + 1
+    if start_idx < len(steps):
+        for i in range(start_idx, len(steps)):
+            st_dict = steps[i]
+            sql = step_to_sql(fname, st_dict, sql)
+        rec["smart_cache"] = {"step_idx": len(steps) - 1, "sql": sql}
+
+    return sql
 
 def step_to_sql(fname: str, step: dict, sql_in: str) -> str:
     t = step["type"]
@@ -292,10 +311,12 @@ def step_to_sql(fname: str, step: dict, sql_in: str) -> str:
         conds = p.get("conds", [])
         if not conds:
             return sql_in
+
         parts = []
         for cnd in conds:
             col = cnd["col"]; kind = cnd["kind"]; op = cnd["op"]; v1 = cnd["v1"]; v2 = cnd.get("v2")
             cc = qident(col)
+
             if kind == "number":
                 num = sql_parse_number(f"{cc}")
                 n1 = sql_parse_number(sql_lit(str(v1)))
@@ -330,7 +351,9 @@ def step_to_sql(fname: str, step: dict, sql_in: str) -> str:
                 elif op == "is_empty": cond = f"length({txt}) = 0"
                 elif op == "not_empty": cond = f"length({txt}) > 0"
                 else: cond = "TRUE"
+
             parts.append(f"({cond})")
+
         glue = " OR " if logic == "OR" else " AND "
         where = glue.join(parts) if parts else "TRUE"
         return f"SELECT * FROM ({sql_in}) WHERE {where}"
@@ -355,7 +378,6 @@ def step_to_sql(fname: str, step: dict, sql_in: str) -> str:
         collision = p.get("collision", "suffix")
 
         right_sql = get_sql(right_file)
-
         con = db()
         try:
             left_cols = [r[0] for r in con.execute(f"DESCRIBE ({sql_in})").fetchall()]
@@ -387,7 +409,7 @@ def step_to_sql(fname: str, step: dict, sql_in: str) -> str:
             SELECT *
             FROM {left} AS A
             {join_type} JOIN {right} AS B
-            ON A.{qident(left_on)} = B.{qident(right_on)}
+            ON A.{qident(left_on)} = B.{qident(right_on if right_on not in dup else right_on)}
         """
 
     if t == "calc":
@@ -436,17 +458,21 @@ def step_to_sql(fname: str, step: dict, sql_in: str) -> str:
 
         if metric == "countifs":
             agg = f"SELECT {bkey} AS k, count(*)::BIGINT AS v FROM ({lookup_sql}) GROUP BY 1"
-            vexpr = "coalesce(B.v, 0)::BIGINT"
         else:
             if declared_type_for_col(lookup_file, value_col) == "text":
                 raise ValueError("Colonna valore formattata come Testo.")
             val = f"{sql_parse_number(qident(value_col))}"
             if metric == "sumifs":
                 agg = f"SELECT {bkey} AS k, coalesce(sum({val}),0.0) AS v FROM ({lookup_sql}) GROUP BY 1"
-                vexpr = "coalesce(B.v, 0.0)"
             else:
                 agg = f"SELECT {bkey} AS k, avg({val}) AS v FROM ({lookup_sql}) GROUP BY 1"
-                vexpr = "B.v"
+
+        if metric == "countifs":
+            vexpr = "coalesce(B.v, 0)::BIGINT"
+        elif metric == "sumifs":
+            vexpr = "coalesce(B.v, 0.0)"
+        else:
+            vexpr = "B.v"
 
         return f"""
             SELECT A.*, {vexpr} AS {qident(outcol)}
@@ -458,28 +484,26 @@ def step_to_sql(fname: str, step: dict, sql_in: str) -> str:
     raise ValueError(f"Step non supportato: {t}")
 
 # =========================
-# SQL builder + cache
+# DATA ACCESS
 # =========================
-def get_sql(fname: str) -> str:
-    rec = st.session_state.STATE["files"][fname]
-    base_sql = f"SELECT * FROM {qident(rec['table_base'])}"
-    steps = rec["steps"]
+def get_cols(fname):
+    if not fname:
+        return []
+    sql = get_sql(fname)
+    con = db()
+    try:
+        cols = [r[0] for r in con.execute(f"DESCRIBE ({sql})").fetchall()]
+        return cols
+    finally:
+        con.close()
 
-    cache_idx = rec["smart_cache"]["step_idx"]
-    sql = rec["smart_cache"]["sql"]
-
-    if cache_idx >= len(steps):
-        cache_idx = -1
-        sql = base_sql
-
-    start_idx = cache_idx + 1
-    if start_idx < len(steps):
-        for i in range(start_idx, len(steps)):
-            st_dict = steps[i]
-            sql = step_to_sql(fname, st_dict, sql)
-        rec["smart_cache"] = {"step_idx": len(steps) - 1, "sql": sql}
-
-    return sql
+def preview_df(fname, limit=100):
+    sql = get_sql(fname)
+    con = db()
+    try:
+        return con.execute(f"SELECT * FROM ({sql}) LIMIT {int(limit)}").df()
+    finally:
+        con.close()
 
 def compute_metric_sql(file_name: str, sql: str, col: str, metric: str, q: float | None = None):
     if metric in ("sum", "average", "median", "quartile", "percentile") and declared_type_for_col(file_name, col) == "text":
@@ -519,9 +543,7 @@ def step_label(st_dict: dict) -> str:
     if t == "format":
         fmts = p.get("formats", {})
         if not fmts: return "Formato"
-        parts = []
-        for c, v in fmts.items():
-            parts.append(f"{c}:{v.get('type','auto')}")
+        parts = [f"{c}:{v.get('type','auto')}" for c, v in fmts.items()]
         return "Formato: " + ", ".join(parts)
     if t == "filter":
         if p["op"] == "between":
@@ -534,7 +556,7 @@ def step_label(st_dict: dict) -> str:
     if t == "ifs":
         return f"{p['metric'].upper()} → '{p['outcol']}' (B={p['lookup_file']})"
     if t == "calc":
-        seq = [f"[{p.get('base_col','')}]"] + [f"{s['op']} [{s['col']}]" for s in p.get("ops", [])]
+        seq = [f"[{p.get('base_col', '')}]"] + [f"{s['op']} [{s['col']}]" for s in p.get("ops", [])]
         return f"CALC: {p['outcol']} = {' '.join(seq)}"
     if t == "dedupe":
         return f"Deduplica su: {p.get('col','')}"
@@ -548,29 +570,11 @@ def _base_add_step(f, step):
     st.session_state.STATE["files"][f]["steps"].append(step)
     clear_cache_from(f, len(st.session_state.STATE["files"][f]["steps"]) - 1)
 
-def get_cols(fname):
-    if not fname: return []
-    sql = get_sql(fname)
-    con = db()
-    try:
-        cols = [r[0] for r in con.execute(f"DESCRIBE ({sql})").fetchall()]
-        return cols
-    finally:
-        con.close()
-
-def preview_df(fname, limit=100):
-    sql = get_sql(fname)
-    con = db()
-    try:
-        return con.execute(f"SELECT * FROM ({sql}) LIMIT {int(limit)}").df()
-    finally:
-        con.close()
-
 # =========================
 # UI
 # =========================
 st.title("⚡ Power Query Web UI (Hugging Face / DuckDB)")
-st.markdown("Stesse funzioni/step della versione pandas, ma esecuzione **on-disk** per file enormi (5GB+).")
+st.markdown("Versione scalabile (on-disk). **Fix inclusi**: le colonne si aggiornano correttamente in ogni sezione quando cambi file.")
 
 files_in_mem = st.session_state.STATE["order"]
 
@@ -585,12 +589,13 @@ with t_files:
         "Modalità Importazione:",
         ["smart", "string"],
         index=1,
-        format_func=lambda x: "SMART (tipi auto - più veloce)" if x == "smart" else "TUTTO STRING (massima stabilità)"
+        format_func=lambda x: "SMART (tipi auto - più veloce)" if x == "smart" else "TUTTO STRING (massima stabilità)",
+        key="import_mode"
     )
 
-    uploaded_files = st.file_uploader("Trascina CSV o Excel qui", accept_multiple_files=True)
+    uploaded_files = st.file_uploader("Trascina CSV o Excel qui", accept_multiple_files=True, key="uploader")
     if uploaded_files:
-        if st.button("Carica File Selezionati", type="primary"):
+        if st.button("Carica File Selezionati", type="primary", key="btn_load"):
             prog = st.progress(0.0, "Upload + ingest in DuckDB...")
             for idx, uf in enumerate(uploaded_files):
                 temp_path = Path(st.session_state.temp_dir) / uf.name
@@ -601,7 +606,7 @@ with t_files:
                     prog.progress(idx / max(1, len(uploaded_files)), text=f"Ingest: {uf.name}")
                     tname, cols = ingest_file_to_duckdb(temp_path, import_mode=import_mode)
                     add_loaded_file(uf.name, tname, cols, temp_path, import_mode)
-                    st.success(f"✅ {uf.name} importato in DuckDB ({len(cols)} colonne)")
+                    st.success(f"✅ {uf.name} importato ({len(cols)} colonne)")
                 except Exception as e:
                     st.error(f"❌ Errore su {uf.name}: {e}")
 
@@ -627,10 +632,14 @@ with t_files:
                             delete_step(fname, i)
                             st.rerun()
 
-        if st.button("🗑️ Svuota Memoria (state)"):
+        if st.button("🗑️ Svuota Memoria (state)", key="btn_clear"):
             st.session_state.STATE = {"files": {}, "order": []}
             st.session_state.calc_ops_list = []
             st.session_state.run_conds = []
+            # reset also dependent widgets
+            for k in list(st.session_state.keys()):
+                if k.startswith(("fmt_", "prev_", "sflt_", "dd_", "m_", "mon_", "calc_", "ifs_", "met_", "exp_")):
+                    st.session_state.pop(k, None)
             st.rerun()
 
 # --- TAB 2: FORMATI & PREVIEW ---
@@ -640,24 +649,25 @@ with t_prev:
 
         with col1:
             st.subheader("Applica Formato")
-            # file selector + reset colonna quando cambia file
-            fmt_file_key = "fmt_file"
-            fmt_col_key = "fmt_col"
-            st.selectbox("File:", files_in_mem, key=fmt_file_key)
-            ensure_dep_updates("fmt", fmt_file_key, [fmt_col_key])
-
             with st.form("fmt_form"):
-                fmt_file = st.session_state.get(fmt_file_key)
-                cols = get_cols(fmt_file) if fmt_file else []
-                st.selectbox("Colonna:", cols, key=fmt_col_key)
-                fmt_col = st.session_state.get(fmt_col_key)
+                # file -> col dependent (FIX)
+                fmt_file = st.selectbox(
+                    "File:",
+                    files_in_mem,
+                    key="fmt_f",
+                    on_change=on_file_change,
+                    args=("fmt_f", "fmt_c"),
+                )
+                fmt_cols = get_cols(fmt_file)
+                _set_first_option("fmt_c", fmt_cols)
 
-                fmt_type = st.selectbox("Tipo:", ["auto", "text", "number", "currency", "percent", "date", "datetime"], key="fmt_type")
+                fmt_col = st.selectbox("Colonna:", fmt_cols, key="fmt_c")
+                fmt_type = st.selectbox("Tipo:", ["auto", "text", "number", "currency", "percent", "date", "datetime"], key="fmt_t")
 
                 date_input = None
                 dec_sep, thou_sep = None, None
                 if fmt_type in ("date", "datetime"):
-                    date_input = st.selectbox("Input Data:", list(DATE_INPUT_MAP.keys()), key="fmt_date_input")
+                    date_input = st.selectbox("Input Data:", list(DATE_INPUT_MAP.keys()), key="fmt_date_in")
                 if fmt_type in ("number", "currency", "percent"):
                     c1, c2 = st.columns(2)
                     dec_sep = c1.selectbox("Decimali:", ["", ".", ","], key="fmt_dec")
@@ -665,23 +675,23 @@ with t_prev:
 
                 submitted = st.form_submit_button("✅ Applica Formato")
                 if submitted:
-                    if not fmt_file or not fmt_col:
-                        st.error("Seleziona file e colonna.")
-                    else:
-                        spec = {"type": fmt_type}
-                        if date_input: spec["date_input"] = date_input
-                        if dec_sep: spec["decimal_sep"] = dec_sep
-                        if thou_sep: spec["thousands_sep"] = thou_sep
-                        step = {"type": "format", "created_at": datetime.now().isoformat(), "params": {"formats": {fmt_col: spec}}}
-                        _base_add_step(fmt_file, step)
-                        st.success("Formato applicato!")
-                        st.rerun()
+                    spec = {"type": fmt_type}
+                    if date_input: spec["date_input"] = date_input
+                    if dec_sep: spec["decimal_sep"] = dec_sep
+                    if thou_sep: spec["thousands_sep"] = thou_sep
+                    step = {"type": "format", "created_at": datetime.now().isoformat(), "params": {"formats": {fmt_col: spec}}}
+                    _base_add_step(fmt_file, step)
+                    st.success("Formato applicato!")
+                    st.rerun()
 
         with col2:
             st.subheader("Anteprima Dati")
-            prev_file_key = "prev_file"
-            st.selectbox("Scegli file:", files_in_mem, key=prev_file_key)
-            prev_file = st.session_state.get(prev_file_key)
+            prev_file = st.selectbox(
+                "Scegli file:",
+                files_in_mem,
+                key="prev_f",
+                on_change=lambda: None
+            )
             if prev_file:
                 df_prev = preview_df(prev_file, limit=100)
                 st.write("Mostrando le prime 100 righe.")
@@ -691,162 +701,139 @@ with t_prev:
 with t_flt:
     if files_in_mem:
         st.subheader("Filtro Singolo")
-
-        # Selettore file fuori dal form, così al cambio file resettiamo le colonne/valori
-        sflt_file_key = "sflt_file"
-        sflt_col_key = "sflt_col"
-        sflt_kind_key = "sflt_kind"
-        sflt_op_key = "sflt_op"
-        sflt_v1_key = "sflt_v1"
-        sflt_v2_key = "sflt_v2"
-
-        st.selectbox("File:", files_in_mem, key=sflt_file_key)
-        ensure_dep_updates("sflt", sflt_file_key, [sflt_col_key, sflt_kind_key, sflt_op_key, sflt_v1_key, sflt_v2_key])
-
         with st.form("single_filter_form"):
-            flt_file = st.session_state.get(sflt_file_key)
-            cols = get_cols(flt_file) if flt_file else []
             c1, c2, c3 = st.columns(3)
-            c1.write("")  # spazio
-            c2.selectbox("Colonna:", cols, key=sflt_col_key)
-            c3.selectbox("Tipo dato:", ["number", "text", "date"], key=sflt_kind_key)
 
-            flt_kind = st.session_state.get(sflt_kind_key, "text")
+            flt_file = c1.selectbox(
+                "File:",
+                files_in_mem,
+                key="sflt_f",
+                on_change=on_file_change,
+                args=("sflt_f", "sflt_c"),
+            )
+            sflt_cols = get_cols(flt_file)
+            _set_first_option("sflt_c", sflt_cols)
+
+            flt_col = c2.selectbox("Colonna:", sflt_cols, key="sflt_c")
+            flt_kind = c3.selectbox("Tipo dato:", ["number", "text", "date"], key="sflt_kind")
+
             ops = OPS_NUMBER if flt_kind == "number" else (OPS_DATE if flt_kind == "date" else OPS_TEXT)
             op_values = [v for (v, _) in ops]
             op_labels = {v: lab for (v, lab) in ops}
 
             c4, c5 = st.columns([1, 2])
-            c4.selectbox("Operatore:", op_values, format_func=lambda v: op_labels.get(v, v), key=sflt_op_key)
-            flt_op = st.session_state.get(sflt_op_key)
+            flt_op = c4.selectbox("Operatore:", op_values, format_func=lambda v: op_labels.get(v, v), key="sflt_op")
 
-            # Input valori coerenti con tipo
             if flt_kind == "date":
-                v1 = c5.date_input("Valore 1", key=sflt_v1_key)
-                v2 = c5.date_input("Valore 2", key=sflt_v2_key) if flt_op == "between" else None
+                v1 = c5.date_input("Valore 1", key="sflt_v1_date")
+                v2 = c5.date_input("Valore 2", key="sflt_v2_date") if flt_op == "between" else None
             else:
-                v1 = c5.text_input("Valore 1", key=sflt_v1_key)
-                v2 = c5.text_input("Valore 2", key=sflt_v2_key) if flt_op == "between" else None
+                v1 = c5.text_input("Valore 1", key="sflt_v1_txt")
+                v2 = c5.text_input("Valore 2", key="sflt_v2_txt") if flt_op == "between" else None
 
             submitted = st.form_submit_button("✅ Applica Filtro Singolo")
             if submitted:
-                flt_col = st.session_state.get(sflt_col_key)
-                flt_kind = st.session_state.get(sflt_kind_key)
-                flt_op = st.session_state.get(sflt_op_key)
-
-                if not flt_file or not flt_col:
-                    st.error("Seleziona file e colonna.")
-                else:
-                    val1 = v1.isoformat() if flt_kind == "date" else v1
-                    val2 = v2.isoformat() if (flt_kind == "date" and v2) else v2
-                    step = {"type":"filter", "created_at": datetime.now().isoformat(),
-                            "params":{"col": flt_col, "kind": flt_kind, "op": flt_op, "v1": val1, "v2": val2}}
-                    _base_add_step(flt_file, step)
-                    st.success("Filtro applicato!")
-                    st.rerun()
+                val1 = v1.isoformat() if flt_kind == "date" else v1
+                val2 = v2.isoformat() if (flt_kind == "date" and v2) else v2
+                step = {"type":"filter", "created_at": datetime.now().isoformat(),
+                        "params":{"col": flt_col, "kind": flt_kind, "op": flt_op, "v1": val1, "v2": val2}}
+                _base_add_step(flt_file, step)
+                st.success("Filtro applicato!")
+                st.rerun()
 
         st.divider()
         st.subheader("Rimuovi Duplicati")
-
-        dd_file_key = "dd_file"
-        dd_col_key = "dd_col"
-        st.selectbox("File:", files_in_mem, key=dd_file_key)
-        ensure_dep_updates("dd", dd_file_key, [dd_col_key])
-
         with st.form("dedupe_form"):
-            dd_file = st.session_state.get(dd_file_key)
-            dd_cols = get_cols(dd_file) if dd_file else []
-            st.selectbox("Colonna chiave:", dd_cols, key=dd_col_key)
+            c1, c2 = st.columns(2)
+
+            dd_file = c1.selectbox(
+                "File:",
+                files_in_mem,
+                key="dd_f",
+                on_change=on_file_change,
+                args=("dd_f", "dd_c"),
+            )
+            dd_cols = get_cols(dd_file)
+            _set_first_option("dd_c", dd_cols)
+
+            dd_col = c2.selectbox("Colonna chiave:", dd_cols, key="dd_c")
             submitted = st.form_submit_button("🧹 Rimuovi Duplicati")
             if submitted:
-                dd_col = st.session_state.get(dd_col_key)
-                if not dd_file or not dd_col:
-                    st.error("Seleziona file e colonna chiave.")
-                else:
-                    step = {"type": "dedupe", "created_at": datetime.now().isoformat(), "params": {"col": dd_col, "keep": "first"}}
-                    _base_add_step(dd_file, step)
-                    st.success("Duplicati rimossi!")
-                    st.rerun()
+                step = {"type": "dedupe", "created_at": datetime.now().isoformat(), "params": {"col": dd_col, "keep": "first"}}
+                _base_add_step(dd_file, step)
+                st.success("Duplicati rimossi!")
+                st.rerun()
 
 # --- TAB 4: MERGE ---
 with t_merge:
     if files_in_mem:
         st.subheader("Unisci due file (Join)")
-
         merge_mode = st.radio(
             "Destinazione:",
             ["existing", "new"],
             format_func=lambda x: "Mergia su file esistente (A)" if x=="existing" else "Crea NUOVO file in memoria",
             key="merge_mode"
         )
-
         new_name = st.text_input("Nome nuovo file:", "merged_1", key="merge_new_name") if merge_mode == "new" else None
 
-        mA_key = "mA_file"
-        mB_key = "mB_file"
-        monA_key = "monA"
-        monB_key = "monB"
-        mhow_key = "mhow"
-        mcoll_key = "mcoll"
-
         c1, c2 = st.columns(2)
-        c1.selectbox("File A (Base):", files_in_mem, key=mA_key)
-        c2.selectbox("File B (Da unire):", files_in_mem, key=mB_key)
 
-        # Reset chiavi dipendenti se cambia A o B
-        ensure_dep_updates("mergeA", mA_key, [monA_key])
-        ensure_dep_updates("mergeB", mB_key, [monB_key])
-
-        m_A = st.session_state.get(mA_key)
-        m_B = st.session_state.get(mB_key)
-
-        c3, c4 = st.columns(2)
-        c3.selectbox("Chiave in A:", get_cols(m_A) if m_A else [], key=monA_key)
-        c4.selectbox("Chiave in B:", get_cols(m_B) if m_B else [], key=monB_key)
-
-        c5, c6 = st.columns(2)
-        c5.selectbox("Tipo Join:", ["left", "right", "inner", "outer"], key=mhow_key)
-        c6.selectbox(
-            "Collisioni nomi:",
-            ["suffix", "keep_left", "keep_right"],
-            format_func=lambda x: "Aggiungi _B automatico" if x=="suffix" else x,
-            key=mcoll_key
+        m_A = c1.selectbox(
+            "File A (Base):",
+            files_in_mem,
+            key="m_A",
+            on_change=on_two_files_change,
+            args=("m_A", "mon_A"),
+        )
+        m_B = c2.selectbox(
+            "File B (Da unire):",
+            files_in_mem,
+            key="m_B",
+            on_change=on_two_files_change,
+            args=("m_B", "mon_B"),
         )
 
-        if st.button("🔗 Esegui Merge", type="primary"):
-            m_on_A = st.session_state.get(monA_key)
-            m_on_B = st.session_state.get(monB_key)
-            m_how = st.session_state.get(mhow_key)
-            m_coll = st.session_state.get(mcoll_key)
+        cols_A = get_cols(m_A)
+        cols_B = get_cols(m_B)
+        _set_first_option("mon_A", cols_A)
+        _set_first_option("mon_B", cols_B)
 
-            if not m_A or not m_B or not m_on_A or not m_on_B:
-                st.error("Seleziona File A, File B e le rispettive chiavi.")
+        c3, c4 = st.columns(2)
+        m_on_A = c3.selectbox("Chiave in A:", cols_A, key="mon_A")
+        m_on_B = c4.selectbox("Chiave in B:", cols_B, key="mon_B")
+
+        c5, c6 = st.columns(2)
+        m_how = c5.selectbox("Tipo Join:", ["left", "right", "inner", "outer"], key="m_how")
+        m_coll = c6.selectbox("Collisioni nomi:", ["suffix", "keep_left", "keep_right"],
+                              format_func=lambda x: "Aggiungi _B automatico" if x=="suffix" else x,
+                              key="m_coll")
+
+        if st.button("🔗 Esegui Merge", type="primary", key="btn_merge"):
+            if merge_mode == "existing":
+                step = {"type": "merge", "created_at": datetime.now().isoformat(),
+                        "params": {"right_file": m_B, "how": m_how, "left_on": m_on_A, "right_on": m_on_B, "collision": m_coll}}
+                _base_add_step(m_A, step)
+                st.success("Merge aggiunto come step!")
+                st.rerun()
             else:
-                if merge_mode == "existing":
-                    step = {"type": "merge", "created_at": datetime.now().isoformat(),
-                            "params": {"right_file": m_B, "how": m_how, "left_on": m_on_A, "right_on": m_on_B, "collision": m_coll}}
-                    _base_add_step(m_A, step)
-                    st.success("Merge aggiunto come step!")
-                    st.rerun()
-                else:
-                    nn = sanitize_name(new_name, "merged_1")
-                    sqlA = get_sql(m_A)
-                    step = {"type": "merge", "created_at": datetime.now().isoformat(),
-                            "params": {"right_file": m_B, "how": m_how, "left_on": m_on_A, "right_on": m_on_B, "collision": m_coll}}
-                    merged_sql = step_to_sql(m_A, step, sqlA)
+                nn = sanitize_name(new_name, "merged_1")
+                sqlA = get_sql(m_A)
+                step = {"type": "merge", "created_at": datetime.now().isoformat(),
+                        "params": {"right_file": m_B, "how": m_how, "left_on": m_on_A, "right_on": m_on_B, "collision": m_coll}}
+                merged_sql = step_to_sql(m_A, step, sqlA)
 
-                    con = db()
-                    try:
-                        tname = f"base_{nn}_{abs(hash((m_A,m_B,datetime.now().isoformat())))%10_000_000}"
-                        tname = sanitize_name(tname)
-                        con.execute(f"CREATE OR REPLACE TABLE {qident(tname)} AS {merged_sql};")
-                        cols = [r[0] for r in con.execute(f"DESCRIBE {qident(tname)}").fetchall()]
-                    finally:
-                        con.close()
+                con = db()
+                try:
+                    tname = f"base_{nn}_{abs(hash((m_A,m_B,datetime.now().isoformat())))%10_000_000}"
+                    tname = sanitize_name(tname)
+                    con.execute(f"CREATE OR REPLACE TABLE {qident(tname)} AS {merged_sql};")
+                    cols = [r[0] for r in con.execute(f"DESCRIBE {qident(tname)}").fetchall()]
+                finally:
+                    con.close()
 
-                    add_loaded_file(nn, tname, cols, path=Path(""), import_mode="smart")
-                    st.success(f"Nuovo file {nn} creato!")
-                    st.rerun()
+                add_loaded_file(nn, tname, cols, path=Path(""), import_mode="smart")
+                st.success(f"Nuovo file {nn} creato!")
+                st.rerun()
 
 # --- TAB 5: CALCOLI & IFS ---
 with t_calc:
@@ -854,114 +841,92 @@ with t_calc:
         st.subheader("Calcoli Multi-Colonna (Riga per Riga)")
         st.info("I vuoti valgono 0. Le operazioni vengono eseguite rigorosamente da sinistra a destra.")
 
-        calc_file_key = "calc_file"
-        calc_base_key = "calc_base"
-        calc_next_key = "calc_next"
-        calc_add_op_key = "calc_add_op"
-        calc_out_key = "calc_out"
-
         c1, c2 = st.columns(2)
-        c1.selectbox("File:", files_in_mem, key=calc_file_key)
-        ensure_dep_updates("calc", calc_file_key, [calc_base_key, calc_next_key])
+        calc_f = c1.selectbox(
+            "File:",
+            files_in_mem,
+            key="calc_f",
+            on_change=on_file_change,
+            args=("calc_f", "calc_base"),
+        )
+        calc_cols = get_cols(calc_f)
+        _set_first_option("calc_base", calc_cols)
+        _set_first_option("calc_next", calc_cols)
 
-        calc_f = st.session_state.get(calc_file_key)
-        cols_calc = get_cols(calc_f) if calc_f else []
-
-        c2.selectbox("Colonna Base:", cols_calc, key=calc_base_key)
-        calc_base = st.session_state.get(calc_base_key)
+        calc_base = c2.selectbox("Colonna Base:", calc_cols, key="calc_base")
 
         with st.container(border=True):
             st.write("Aggiungi operazioni in sequenza:")
             cc1, cc2, cc3 = st.columns([2, 3, 1])
-            cc1.selectbox(
+            add_op = cc1.selectbox(
                 "Op:",
                 ["add", "sub", "mul", "div"],
-                key=calc_add_op_key,
+                key="calc_add_op",
                 format_func=lambda x: {"add":"+ (Somma)","sub":"- (Sottrai)","mul":"* (Moltiplica)","div":"/ (Dividi)"}[x]
             )
-            cc2.selectbox("Con colonna:", cols_calc, key=calc_next_key)
+            add_col = cc2.selectbox("Con colonna:", calc_cols, key="calc_next")
 
-            if cc3.button("➕ Aggiungi Op"):
-                op = st.session_state.get(calc_add_op_key)
-                col = st.session_state.get(calc_next_key)
-                if calc_f and calc_base and col:
-                    st.session_state.calc_ops_list.append({"op": op, "col": col})
-                    st.rerun()
+            if cc3.button("➕ Aggiungi Op", key="btn_add_calc_op"):
+                st.session_state.calc_ops_list.append({"op": add_op, "col": add_col})
+                st.rerun()
 
             if st.session_state.calc_ops_list:
                 formula = f"[{calc_base}]"
                 for op in st.session_state.calc_ops_list:
                     formula += f" {op['op']} [{op['col']}]"
                 st.code(formula, language="text")
-                if st.button("Reset Operazioni"):
+                if st.button("Reset Operazioni", key="btn_reset_ops"):
                     st.session_state.calc_ops_list = []
                     st.rerun()
 
-        st.text_input("Nome nuova colonna:", "calc_row_1", key=calc_out_key)
-        if st.button("✅ Esegui Calcolo", type="primary"):
-            calc_out = st.session_state.get(calc_out_key)
-            if not calc_f or not calc_base or not calc_out:
-                st.error("Seleziona file, colonna base e nome colonna output.")
-            else:
-                step = {"type": "calc", "created_at": datetime.now().isoformat(),
-                        "params": {"base_col": calc_base, "ops": st.session_state.calc_ops_list, "outcol": calc_out}}
-                _base_add_step(calc_f, step)
-                st.session_state.calc_ops_list = []
-                st.success("Calcolo applicato!")
-                st.rerun()
+        calc_out = st.text_input("Nome nuova colonna:", "calc_row_1", key="calc_out")
+        if st.button("✅ Esegui Calcolo", type="primary", key="btn_do_calc"):
+            step = {"type": "calc", "created_at": datetime.now().isoformat(),
+                    "params": {"base_col": calc_base, "ops": st.session_state.calc_ops_list, "outcol": calc_out}}
+            _base_add_step(calc_f, step)
+            st.session_state.calc_ops_list = []
+            st.success("Calcolo applicato!")
+            st.rerun()
 
         st.divider()
         st.subheader("Aggregazione IFS (Es. Somma se, Conta se)")
-
-        ifsA_key = "ifsA"
-        ifsB_key = "ifsB"
-        imA_key = "imA"
-        imB_key = "imB"
-        ifs_metric_key = "ifs_metric"
-        ifs_valcol_key = "ifs_valcol"
-        ifs_out_key = "ifs_out"
-
-        c1, c2 = st.columns(2)
-        c1.selectbox("File Destinazione (A):", files_in_mem, key=ifsA_key)
-        c2.selectbox("File Ricerca (B):", files_in_mem, key=ifsB_key)
-
-        ensure_dep_updates("ifsA", ifsA_key, [imA_key])
-        ensure_dep_updates("ifsB", ifsB_key, [imB_key, ifs_valcol_key])
-
-        ifs_A = st.session_state.get(ifsA_key)
-        ifs_B = st.session_state.get(ifsB_key)
-
         with st.form("ifs_form"):
+            c1, c2 = st.columns(2)
+
+            ifs_A = c1.selectbox(
+                "File Destinazione (A):",
+                files_in_mem,
+                key="ifs_a",
+                on_change=on_file_change,
+                args=("ifs_a", "im_a"),
+            )
+            ifs_B = c2.selectbox(
+                "File Ricerca (B):",
+                files_in_mem,
+                key="ifs_b",
+                on_change=on_file_change,
+                args=("ifs_b", "im_b"),
+            )
+
+            cols_A = get_cols(ifs_A)
+            cols_B = get_cols(ifs_B)
+            _set_first_option("im_a", cols_A)
+            _set_first_option("im_b", cols_B)
+            _set_first_option("ifs_val_col", [""] + cols_B)
+
             c3, c4 = st.columns(2)
-            c3.selectbox("Col. Match in A:", get_cols(ifs_A) if ifs_A else [], key=imA_key)
-            c4.selectbox("Col. Match in B:", get_cols(ifs_B) if ifs_B else [], key=imB_key)
+            ifs_match_a = c3.selectbox("Col. Match in A:", cols_A, key="im_a")
+            ifs_match_b = c4.selectbox("Col. Match in B:", cols_B, key="im_b")
 
             c5, c6 = st.columns(2)
-            c5.selectbox("Funzione:", ["countifs", "sumifs", "averageifs"], key=ifs_metric_key)
-            metric = st.session_state.get(ifs_metric_key, "countifs")
+            metric = c5.selectbox("Funzione:", ["countifs", "sumifs", "averageifs"], key="ifs_metric")
+            val_col = c6.selectbox("Colonna Valore (in B):", [""] + cols_B, key="ifs_val_col")
 
-            colsB = get_cols(ifs_B) if ifs_B else []
-            if metric in ["sumifs", "averageifs"]:
-                c6.selectbox("Colonna Valore (in B):", [""] + colsB, key=ifs_valcol_key)
-            else:
-                # anche se non serve, teniamo key coerente
-                if ifs_valcol_key in st.session_state:
-                    pass
-                c6.selectbox("Colonna Valore (in B):", [""] + colsB, key=ifs_valcol_key)
-
-            st.text_input("Nome nuova colonna in A:", "ifs_result_1", key=ifs_out_key)
+            ifs_out = st.text_input("Nome nuova colonna in A:", "ifs_result_1", key="ifs_out")
 
             submitted = st.form_submit_button("✅ Esegui IFS")
             if submitted:
-                ifs_match_a = st.session_state.get(imA_key)
-                ifs_match_b = st.session_state.get(imB_key)
-                metric = st.session_state.get(ifs_metric_key)
-                val_col = st.session_state.get(ifs_valcol_key, "")
-                ifs_out = st.session_state.get(ifs_out_key)
-
-                if not ifs_A or not ifs_B or not ifs_match_a or not ifs_match_b or not ifs_out:
-                    st.error("Seleziona file A/B, colonne match e nome colonna output.")
-                elif metric in ["sumifs", "averageifs"] and not val_col:
+                if metric in ["sumifs", "averageifs"] and not val_col:
                     st.error("Seleziona una colonna valore per SUM/AVERAGE.")
                 else:
                     step = {"type":"ifs", "created_at": datetime.now().isoformat(),
@@ -975,33 +940,29 @@ with t_calc:
 with t_metr:
     if files_in_mem:
         st.subheader("Calcola Metrica Veloce (Senza creare Step)")
-
-        met_file_key = "met_file"
-        met_col_key = "met_col"
-        st.selectbox("File:", files_in_mem, key=met_file_key)
-        ensure_dep_updates("met", met_file_key, [met_col_key])
-
-        met_file = st.session_state.get(met_file_key)
-        cols_met = get_cols(met_file) if met_file else []
-
         c1, c2 = st.columns(2)
-        c1.selectbox("Colonna:", cols_met, key=met_col_key)
-        c2.selectbox("Metrica:", ["sum", "count", "counta", "average", "median", "quartile", "percentile"], key="met_kind")
 
-        met_kind = st.session_state.get("met_kind")
-        q_val = None
-        if met_kind in ["quartile", "percentile"]:
-            q_val = st.text_input("Q/Percentile (es. 0.25):", "0.25", key="met_q")
+        met_file = c1.selectbox(
+            "File:",
+            files_in_mem,
+            key="met_f",
+            on_change=on_file_change,
+            args=("met_f", "met_c"),
+        )
+        met_cols = get_cols(met_file)
+        _set_first_option("met_c", met_cols)
 
-        if st.button("📌 Calcola", type="primary"):
+        met_col = c2.selectbox("Colonna:", met_cols, key="met_c")
+
+        c3, c4 = st.columns(2)
+        met_kind = c3.selectbox("Metrica:", ["sum", "count", "counta", "average", "median", "quartile", "percentile"], key="met_kind")
+        q_val = c4.text_input("Q/Percentile (es. 0.25):", "0.25", key="met_q") if met_kind in ["quartile", "percentile"] else None
+
+        if st.button("📌 Calcola", type="primary", key="btn_metric"):
             try:
-                met_col = st.session_state.get(met_col_key)
-                if not met_file or not met_col:
-                    st.error("Seleziona file e colonna.")
-                else:
-                    sql = get_sql(met_file)
-                    val = compute_metric_sql(met_file, sql, met_col, met_kind, q=float(q_val) if q_val else None)
-                    st.success(f"Risultato **{met_kind.upper()}** su {met_col}: **{val}**")
+                sql = get_sql(met_file)
+                val = compute_metric_sql(met_file, sql, met_col, met_kind, q=float(q_val) if q_val else None)
+                st.success(f"Risultato **{met_kind.upper()}** su {met_col}: **{val}**")
             except Exception as e:
                 st.error(f"Errore: {e}")
 
@@ -1011,38 +972,31 @@ with t_exp:
         st.subheader("Esporta Risultati (CSV)")
         st.info("Export scalabile: DuckDB scrive su file via COPY senza caricare tutto in RAM.")
 
-        exp_file_key = "exp_file"
-        st.selectbox("File da esportare:", files_in_mem, key=exp_file_key)
-        exp_file = st.session_state.get(exp_file_key)
+        export_f = st.selectbox("File da esportare:", files_in_mem, key="exp_f")
+        exp_name = st.text_input("Nome file output:", f"export_{export_f}", key="exp_name")
 
-        exp_name_key = "exp_name"
-        st.text_input("Nome file output:", f"export_{exp_file}" if exp_file else "export", key=exp_name_key)
+        if st.button("Genera File CSV", key="btn_export"):
+            sql = get_sql(export_f)
+            out_path = Path(st.session_state.temp_dir) / f"{sanitize_name(exp_name)}.csv"
 
-        if st.button("Genera File CSV"):
-            if not exp_file:
-                st.error("Seleziona un file.")
-            else:
-                sql = get_sql(exp_file)
-                exp_name = st.session_state.get(exp_name_key) or f"export_{exp_file}"
-                out_path = Path(st.session_state.temp_dir) / f"{sanitize_name(exp_name)}.csv"
+            con = db()
+            try:
+                con.execute(f"""
+                    COPY (SELECT * FROM ({sql}))
+                    TO {sql_lit(str(out_path))}
+                    (HEADER, DELIMITER ',');
+                """)
+            finally:
+                con.close()
 
-                con = db()
-                try:
-                    con.execute(f"""
-                        COPY (SELECT * FROM ({sql}))
-                        TO {sql_lit(str(out_path))}
-                        (HEADER, DELIMITER ',');
-                    """)
-                finally:
-                    con.close()
+            with open(out_path, "rb") as f:
+                data = f.read()
 
-                with open(out_path, "rb") as f:
-                    data = f.read()
-
-                st.download_button(
-                    label=f"⬇️ Scarica {sanitize_name(exp_name)}.csv",
-                    data=data,
-                    file_name=f"{sanitize_name(exp_name)}.csv",
-                    mime="text/csv",
-                    type="primary"
-                )
+            st.download_button(
+                label=f"⬇️ Scarica {sanitize_name(exp_name)}.csv",
+                data=data,
+                file_name=f"{sanitize_name(exp_name)}.csv",
+                mime="text/csv",
+                type="primary",
+                key="download_csv"
+            )
